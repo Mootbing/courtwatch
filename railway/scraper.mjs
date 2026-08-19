@@ -49,22 +49,65 @@ function addMinutes(time, minutes) {
   return `${String(Math.floor(total / 60) % 24).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
 }
 
-async function openDate(page, url, date) {
+async function extractCards(page) {
+  return page.locator("div.rounded-xl.border.border-gray-200.p-3").evaluateAll((elements) =>
+    elements.map((card) => {
+      const link = card.querySelector('a[href^="/locations/"]');
+      const name =
+        card.querySelector('a[href^="/locations/"] p')?.textContent?.trim() ||
+        card.querySelector("img")?.getAttribute("alt") ||
+        "";
+      const sections = [...card.querySelectorAll(":scope > div > div")].slice(1);
+      const activities = sections.map((section) => {
+        const activity = section.querySelector(":scope > p")?.textContent?.trim() || "";
+        const openings = [...section.querySelectorAll(".swiper-slide > button")].map((button) => {
+          const time = button.querySelector("p")?.textContent?.trim() || "";
+          const values = [...button.querySelectorAll("div")]
+            .map((element) => element.textContent?.trim())
+            .filter(Boolean);
+          return { time, duration: Number(values.at(-1)) || 60 };
+        });
+        return { activity, openings };
+      });
+      return { name, href: link?.getAttribute("href") || "", activities };
+    }),
+  );
+}
+
+async function loadDay(page, url, date) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      const response = await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      const status = response?.status() ?? 0;
+      if (status === 429 || status >= 500) throw new Error(`Rec responded with HTTP ${status} for ${date}`);
       await page.locator("div.rounded-xl.border.border-gray-200.p-3").first().waitFor({
         state: "visible",
         timeout: 30_000,
       });
-      // Location cards render before their availability carousels finish hydrating.
-      await page.waitForTimeout(2_000);
-      return;
+      // Location cards render before their availability carousels finish hydrating; a fixed
+      // sleep is not enough on cold loads, so wait for a slide button (fully booked days
+      // legitimately never get one, hence the swallowed timeout) plus a short settle.
+      await page
+        .waitForFunction(() => document.querySelector(".swiper-slide button"), { timeout: 10_000 })
+        .catch(() => {});
+      await page.waitForTimeout(1_000);
+      const cards = await extractCards(page);
+      const openings = cards.reduce(
+        (total, card) => total + card.activities.reduce((n, activity) => n + activity.openings.length, 0),
+        0,
+      );
+      if (openings === 0 && attempt < 3) {
+        console.warn(`No openings visible for ${date} (attempt ${attempt}/3); retrying in case hydration lagged.`);
+        await page.waitForTimeout(3_000 * attempt);
+        continue;
+      }
+      return cards;
     } catch (error) {
       lastError = error;
       console.warn(`Rec page failed for ${date} (attempt ${attempt}/3): ${error.message}`);
-      if (attempt < 3) await page.waitForTimeout(1_500 * attempt);
+      // Back off harder when the failure looks like rate limiting.
+      if (attempt < 3) await page.waitForTimeout((/HTTP (429|5\d\d)/.test(error.message) ? 10_000 : 2_000) * attempt);
     }
   }
   throw new Error(`Rec availability did not load for ${date} after 3 attempts`, { cause: lastError });
@@ -78,6 +121,7 @@ export async function scrapeAvailability({ days = 8 } = {}) {
   });
 
   const slots = [];
+  const failedDates = [];
   try {
     const page = await browser.newPage({
       locale: "en-US",
@@ -85,35 +129,30 @@ export async function scrapeAvailability({ days = 8 } = {}) {
       viewport: { width: 1365, height: 900 },
       userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36 CourtWatchSF/1.0",
     });
+    // The card markup only needs the img alt text, so skip heavy assets to keep the
+    // request volume low enough that eight back-to-back loads do not trip rate limiting.
+    await page.route("**/*", (route) => {
+      const type = route.request().resourceType();
+      return type === "image" || type === "media" || type === "font" ? route.abort() : route.continue();
+    });
 
     for (let offset = 0; offset < days; offset += 1) {
       const date = sfDate(offset);
       const dateParam = `${date}T12:00:00.000Z`;
       const url = `${SOURCE_URL}&date=${encodeURIComponent(dateParam)}`;
-      await openDate(page, url, date);
 
-      const cards = await page.locator("div.rounded-xl.border.border-gray-200.p-3").evaluateAll((elements) =>
-        elements.map((card) => {
-          const link = card.querySelector('a[href^="/locations/"]');
-          const name =
-            card.querySelector('a[href^="/locations/"] p')?.textContent?.trim() ||
-            card.querySelector("img")?.getAttribute("alt") ||
-            "";
-          const sections = [...card.querySelectorAll(":scope > div > div")].slice(1);
-          const activities = sections.map((section) => {
-            const activity = section.querySelector(":scope > p")?.textContent?.trim() || "";
-            const openings = [...section.querySelectorAll(".swiper-slide > button")].map((button) => {
-              const time = button.querySelector("p")?.textContent?.trim() || "";
-              const values = [...button.querySelectorAll("div")]
-                .map((element) => element.textContent?.trim())
-                .filter(Boolean);
-              return { time, duration: Number(values.at(-1)) || 60 };
-            });
-            return { activity, openings };
-          });
-          return { name, href: link?.getAttribute("href") || "", activities };
-        }),
-      );
+      let cards;
+      try {
+        cards = await loadDay(page, url, date);
+      } catch (error) {
+        // One bad day must not sink the other seven; the caller backfills it
+        // from the previous snapshot.
+        console.error(error.message);
+        failedDates.push(date);
+        continue;
+      } finally {
+        if (offset < days - 1) await page.waitForTimeout(1_500 + Math.floor(Math.random() * 1_500));
+      }
 
       cards.forEach((card) => {
         const locationId = card.href.split("/").filter(Boolean).at(-1);
@@ -143,6 +182,10 @@ export async function scrapeAvailability({ days = 8 } = {}) {
     await browser.close();
   }
 
+  if (failedDates.length === days) {
+    throw new Error(`All ${days} days failed to load; keeping the previous snapshot.`);
+  }
+
   const uniqueSlots = [...new Map(slots.map((slot) => [slot.id, slot])).values()];
   uniqueSlots.sort((a, b) => `${a.date}${a.startTime}${a.courtName}`.localeCompare(`${b.date}${b.startTime}${b.courtName}`));
 
@@ -152,6 +195,7 @@ export async function scrapeAvailability({ days = 8 } = {}) {
     timezone: TIMEZONE,
     status: "live",
     window: { start: sfDate(0), end: sfDate(days - 1) },
+    failedDates,
     slots: uniqueSlots,
   };
 }
